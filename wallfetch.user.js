@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WallFetch
 // @namespace    https://github.com/itachi-re/wallfetch
-// @version      1.0.0
+// @version      1.5.0
 // @description  Download original-resolution wallpapers from Wallhaven with metadata, persistent settings, download queue, and advanced customization.
 // @author       itachi-re
 // @license      MIT
@@ -30,7 +30,13 @@
 
 // @run-at       document-idle
 // @noframes
+// @homepage      https://github.com/itachi-re/wallfetch
+// @source        https://github.com/itachi-re/wallfetch
+// @compatible    chrome
+// @compatible    firefox
+// @compatible    edge
 // ==/UserScript==
+
 /*
  * MIT License
  *
@@ -53,59 +59,22 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
+ *
+ * NOTE: Update @downloadURL / @updateURL above to point at wherever you
+ * actually host this file (GitHub raw, GreasyFork, etc.) before publishing.
  */
 
 (() => {
   'use strict';
 
-  /* ==========================================================================
-   * CONFIG
-   * Central place for all user-tunable behaviour. Nothing else in the script
-   * should contain magic numbers/strings that belong here.
-   * ======================================================================== */
-  const CONFIG = Object.freeze({
-    // --- Download behaviour -------------------------------------------------
-    saveAs: false, // true = browser "Save As" dialog, false = silent save to default downloads folder
-    removeWallhavenPrefix: true, // strip the "wallhaven-" prefix from the original filename
-    filenameTemplate: '{id}', // supported tokens: {id} {resolution} {category} {ext} {size}
-    sanitizeFilenames: true, // strip characters that are invalid on common filesystems
-    preventDuplicates: true, // warn (and require confirmation) before re-downloading the same wall this session
-
-    // --- UI / UX -------------------------------------------------------------
-    darkTheme: true, // match Wallhaven's dark UI palette
-    showNotifications: true, // in-page toast notifications
-    showProgress: true, // show a progress ring/bar while downloading
-    toastDurationMs: 4200,
-    enableContextMenu: true, // custom right-click menu on the wallpaper image
-    enableFloatingFallback: true, // if the native action bar can't be located, show a floating button instead
-
-    // --- Keyboard shortcuts ---------------------------------------------------
-    keyboardShortcuts: true,
-    shortcuts: {
-      download: { key: 'd', ctrl: false, shift: false, alt: false }, // D
-      downloadNoDialog: { key: 'd', ctrl: true, shift: false, alt: false }, // Ctrl+D
-      copyUrl: { key: 'd', ctrl: false, shift: true, alt: false }, // Shift+D
-      copyFilename: { key: 'd', ctrl: false, shift: false, alt: true }, // Alt+D
-    },
-
-    // --- Reliability ---------------------------------------------------------
-    retryCount: 3,
-    retryDelay: 1000, // ms, multiplied by attempt number (linear backoff)
-    elementWaitTimeout: 8000, // ms to wait for DOM targets before falling back
-    domObserverDebounce: 250, // ms
-
-    // --- Debugging -------------------------------------------------------------
-    debug: false,
-  });
-
-  const LOG_PREFIX = '[Wallhaven Original Downloader]';
+  const LOG_PREFIX = '[Wallhaven Enhanced Downloader+]';
 
   /**
    * Minimal internal logger so debug output can be toggled from one place.
    */
   const Logger = {
     debug(...args) {
-      if (CONFIG.debug) console.debug(LOG_PREFIX, ...args);
+      if (Config.STATIC.debug) console.debug(LOG_PREFIX, ...args);
     },
     info(...args) {
       console.info(LOG_PREFIX, ...args);
@@ -115,6 +84,188 @@
     },
     error(...args) {
       console.error(LOG_PREFIX, ...args);
+    },
+  };
+
+  /* ==========================================================================
+   * CONFIG
+   * Two tiers: STATIC (constants that rarely change and aren't exposed in the
+   * settings UI) and PERSISTED_DEFAULTS (user-configurable values that are
+   * loaded from / saved to GM storage by the Settings module below).
+   * ======================================================================== */
+  const Config = Object.freeze({
+    STATIC: Object.freeze({
+      darkTheme: true,
+      showProgress: true,
+      toastDurationMs: 4200,
+      elementWaitTimeout: 8000,
+      domObserverDebounce: 250,
+      retryDelay: 1000, // ms, multiplied by attempt number (linear backoff)
+      enableFloatingFallback: true,
+      sanitizeFilenames: true,
+      debug: false,
+      shortcuts: Object.freeze({
+        download: { key: 'd', ctrl: false, shift: false, alt: false }, // D
+        downloadNoDialog: { key: 'd', ctrl: true, shift: false, alt: false }, // Ctrl+D
+        copyUrl: { key: 'd', ctrl: false, shift: true, alt: false }, // Shift+D
+        copyFilename: { key: 'd', ctrl: false, shift: false, alt: true }, // Alt+D
+      }),
+    }),
+
+    /** User-configurable values, persisted via GM_getValue/GM_setValue. */
+    PERSISTED_DEFAULTS: Object.freeze({
+      saveAs: false,
+      filenameTemplate: '{id}',
+      showNotifications: true,
+      preventDuplicates: true,
+      keyboardShortcuts: true,
+      enableContextMenu: true,
+      retryCount: 3,
+      removeWallhavenPrefix: true,
+      apiKey: '', // optional Wallhaven API key, needed to read NSFW metadata
+    }),
+
+    STORAGE_PREFIX: 'wod_',
+    HISTORY_KEY: 'wod_download_history',
+    MAX_HISTORY_ENTRIES: 300,
+  });
+
+  /** User-friendly text for classified download/API errors. */
+  const ERROR_MESSAGES = Object.freeze({
+    FORBIDDEN: 'Access denied (403) — the file may be protected or you may be rate-limited.',
+    NOT_FOUND: 'Original image not found (404) — it may have been removed.',
+    RATE_LIMITED: 'Rate limited by Wallhaven (429) — please wait a moment and retry.',
+    CHALLENGE_PAGE: 'Received a verification page instead of the image (possible Cloudflare challenge).',
+    INVALID_CONTENT_TYPE: 'The server did not return an image file; refusing to save it.',
+    EMPTY_RESPONSE: 'The downloaded file was empty; refusing to save it.',
+    NETWORK_ERROR: 'A network error occurred while downloading.',
+    TIMEOUT: 'The download timed out.',
+    HTTP_ERROR: 'The server returned an unexpected response.',
+    GM_DOWNLOAD_FAILED: 'Your userscript manager could not save the file.',
+    ALREADY_QUEUED: 'This wallpaper is already queued for download.',
+    PERMISSION_DENIED: 'Download permission was denied by the browser or extension.',
+  });
+
+  /**
+   * Build an Error carrying a machine-readable `code` for classification.
+   * @param {string} code
+   * @param {string} message
+   */
+  function classifiedError(code, message) {
+    const err = new Error(message);
+    err.code = code;
+    return err;
+  }
+
+  /* ==========================================================================
+   * GMC (GreaseMonkey Compatibility shim)
+   * Every GM_* API is called through here so the script degrades gracefully
+   * across Tampermonkey, Violentmonkey, FireMonkey, and Greasemonkey's
+   * promise-based GM.* namespace, without scattering feature-detection
+   * throughout the rest of the code.
+   * ======================================================================== */
+  const GMC = {
+    hasDownload() {
+      return typeof GM_download === 'function';
+    },
+    download(details) {
+      if (typeof GM_download === 'function') return GM_download(details);
+      throw classifiedError('GM_DOWNLOAD_FAILED', 'GM_download is not available in this userscript manager.');
+    },
+    xmlHttpRequest(details) {
+      if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest(details);
+      if (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function') return GM.xmlHttpRequest(details);
+      throw classifiedError('NETWORK_ERROR', 'GM_xmlhttpRequest is not available in this userscript manager.');
+    },
+    setClipboard(text, type) {
+      if (typeof GM_setClipboard === 'function') return GM_setClipboard(text, type);
+      if (typeof GM !== 'undefined' && typeof GM.setClipboard === 'function') return GM.setClipboard(text, type);
+      return null;
+    },
+    addStyle(css) {
+      if (typeof GM_addStyle === 'function') return GM_addStyle(css);
+      if (typeof GM !== 'undefined' && typeof GM.addStyle === 'function') return GM.addStyle(css);
+      const style = document.createElement('style');
+      style.textContent = css;
+      document.head.appendChild(style);
+      return style;
+    },
+    registerMenuCommand(label, fn) {
+      if (typeof GM_registerMenuCommand === 'function') return GM_registerMenuCommand(label, fn);
+      if (typeof GM !== 'undefined' && typeof GM.registerMenuCommand === 'function') return GM.registerMenuCommand(label, fn);
+      return null;
+    },
+    openInTab(url, options) {
+      if (typeof GM_openInTab === 'function') return GM_openInTab(url, options);
+      if (typeof GM !== 'undefined' && typeof GM.openInTab === 'function') return GM.openInTab(url, options);
+      window.open(url, '_blank', 'noopener');
+      return null;
+    },
+    async getValue(key, defaultValue) {
+      try {
+        if (typeof GM_getValue === 'function') return GM_getValue(key, defaultValue);
+        if (typeof GM !== 'undefined' && typeof GM.getValue === 'function') return await GM.getValue(key, defaultValue);
+      } catch (err) {
+        Logger.warn(`GM getValue failed for "${key}"`, err);
+      }
+      return defaultValue;
+    },
+    async setValue(key, value) {
+      try {
+        if (typeof GM_setValue === 'function') return GM_setValue(key, value);
+        if (typeof GM !== 'undefined' && typeof GM.setValue === 'function') return await GM.setValue(key, value);
+      } catch (err) {
+        Logger.warn(`GM setValue failed for "${key}"`, err);
+      }
+      return undefined;
+    },
+  };
+
+  /* ==========================================================================
+   * SETTINGS
+   * Loads user-configurable values from GM storage at startup, exposes a
+   * synchronous `get()` for the rest of the app, and persists changes made
+   * through the Settings UI. Falls back to Config.PERSISTED_DEFAULTS for any
+   * key that has never been saved.
+   * ======================================================================== */
+  const Settings = {
+    values: { ...Config.PERSISTED_DEFAULTS },
+    _loaded: false,
+
+    async init() {
+      const keys = Object.keys(Config.PERSISTED_DEFAULTS);
+      const loaded = await Promise.all(
+        keys.map((key) => GMC.getValue(Config.STORAGE_PREFIX + key, Config.PERSISTED_DEFAULTS[key]))
+      );
+      keys.forEach((key, index) => {
+        this.values[key] = loaded[index];
+      });
+      this._loaded = true;
+      Logger.debug('Settings loaded', this.values);
+    },
+
+    /** @param {string} key */
+    get(key) {
+      return Object.prototype.hasOwnProperty.call(this.values, key)
+        ? this.values[key]
+        : Config.PERSISTED_DEFAULTS[key];
+    },
+
+    /**
+     * @param {string} key
+     * @param {*} value
+     */
+    async set(key, value) {
+      this.values[key] = value;
+      await GMC.setValue(Config.STORAGE_PREFIX + key, value);
+    },
+
+    async resetAll() {
+      for (const key of Object.keys(Config.PERSISTED_DEFAULTS)) {
+        this.values[key] = Config.PERSISTED_DEFAULTS[key];
+        // eslint-disable-next-line no-await-in-loop
+        await GMC.setValue(Config.STORAGE_PREFIX + key, Config.PERSISTED_DEFAULTS[key]);
+      }
     },
   };
 
@@ -134,7 +285,7 @@
      */
     waitForElement(selector, options = {}) {
       const root = options.root ?? document;
-      const timeout = options.timeout ?? CONFIG.elementWaitTimeout;
+      const timeout = options.timeout ?? Config.STATIC.elementWaitTimeout;
 
       const existing = root.querySelector(selector);
       if (existing) return Promise.resolve(existing);
@@ -185,11 +336,28 @@
     },
 
     /**
-     * Find a sidebar "stat" value (e.g. Resolution, Size) by its label text.
-     * Wallhaven renders stats as label/value pairs (dt/dd, or similarly
-     * structured elements). We search generically by visible label text
-     * instead of relying on specific class names, so the script keeps working
-     * even if Wallhaven changes its markup/classes.
+     * Format a byte count into a human-readable string (e.g. "1.16 MB").
+     * @param {number|null|undefined} bytes
+     * @returns {string}
+     */
+    formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return 'unknown';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      let value = bytes;
+      let unitIndex = 0;
+      while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex += 1;
+      }
+      return `${value.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
+    },
+
+    /**
+     * Find a sidebar "stat" value (e.g. Resolution, Size, Views) by its label
+     * text. Used only as a fallback when the Wallhaven API is unreachable.
+     * Wallhaven renders stats as label/value pairs; searching generically by
+     * visible label text (instead of relying on class names) keeps this
+     * working even if markup/classes change.
      *
      * @param {string} label - e.g. "Resolution" or "Size"
      * @returns {string|null}
@@ -204,8 +372,7 @@
         const text = (el.textContent || '').trim().toLowerCase();
         if (text !== needle) continue;
 
-        // Prefer an explicit <dd>, otherwise the next element sibling.
-        let value = el.nextElementSibling;
+        const value = el.nextElementSibling;
         if (value && value.textContent) {
           return value.textContent.trim();
         }
@@ -214,10 +381,8 @@
     },
 
     /**
-     * Best-effort detection of the wallpaper's category (general/anime/people).
-     * Wallhaven highlights the active category icon in the sidebar; since the
-     * exact class names are not guaranteed stable, several heuristics are
-     * tried and the function degrades gracefully to `null`.
+     * Best-effort detection of the wallpaper's category (general/anime/people)
+     * from the HTML. Only used when the API is unreachable.
      * @returns {string|null}
      */
     detectCategory() {
@@ -238,7 +403,6 @@
         }
       }
 
-      // Fall back to scanning known category keywords in tag links.
       const tagLinks = document.querySelectorAll('#tags a, .tag-list a, a.tag');
       for (const link of tagLinks) {
         const href = link.getAttribute('href') || '';
@@ -247,6 +411,36 @@
       }
 
       return null;
+    },
+
+    /**
+     * Best-effort detection of purity (sfw/sketchy/nsfw) from the HTML.
+     * Only used when the API is unreachable.
+     * @returns {string|null}
+     */
+    detectPurity() {
+      const fromStat = Utils.findStatByLabel('Purity');
+      if (fromStat) return fromStat.toLowerCase();
+
+      const activeSelectors = ['.purity-icons .active', '[data-purity].active'];
+      for (const selector of activeSelectors) {
+        const el = document.querySelector(selector);
+        if (el) {
+          const text = (el.textContent || el.getAttribute('title') || '').trim().toLowerCase();
+          if (text) return text;
+        }
+      }
+      return null;
+    },
+
+    /**
+     * Best-effort detection of the uploader's username from the HTML.
+     * Only used when the API is unreachable.
+     * @returns {string|null}
+     */
+    detectUploader() {
+      const link = document.querySelector('a[href^="/user/"]');
+      return link ? link.textContent.trim() : null;
     },
 
     /**
@@ -295,7 +489,7 @@
      * @returns {string}
      */
     sanitizeFilename(name) {
-      if (!CONFIG.sanitizeFilenames) return name;
+      if (!Config.STATIC.sanitizeFilenames) return name;
       return name
         .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
         .replace(/\s+/g, '_')
@@ -304,30 +498,44 @@
     },
 
     /**
-     * Render a filename from CONFIG.filenameTemplate, substituting tokens.
-     * @param {{id:string, resolution:string, category:string, ext:string, size:string}} data
+     * Render a filename from the configured template, substituting tokens.
+     * Supported tokens: {id} {resolution} {width} {height} {ratio}
+     * {category} {ext} {extension} {size} {filesize} {views} {favorites}
+     * {purity} {uploader} {colors} {date}
+     *
+     * @param {import('./WallpaperData').WallpaperMeta} data
      * @returns {string}
      */
     renderFilename(data) {
+      const ext = data.ext ?? 'jpg';
       const tokens = {
         '{id}': data.id ?? 'unknown',
         '{resolution}': Utils.normalizeResolution(data.resolution),
+        '{width}': data.width ?? 'unknown',
+        '{height}': data.height ?? 'unknown',
+        '{ratio}': data.ratio ?? 'unknown',
         '{category}': data.category ?? 'wallpaper',
-        '{ext}': data.ext ?? 'jpg',
+        '{ext}': ext,
+        '{extension}': ext,
         '{size}': data.size ?? 'unknown',
+        '{filesize}': data.filesize != null ? Utils.formatBytes(data.filesize) : data.size ?? 'unknown',
+        '{views}': data.views ?? 'unknown',
+        '{favorites}': data.favorites ?? 'unknown',
+        '{purity}': data.purity ?? 'unknown',
+        '{uploader}': data.uploader ?? 'unknown',
+        '{colors}': data.colors ?? 'unknown',
+        '{date}': data.date ?? 'unknown',
       };
 
-      let base = CONFIG.filenameTemplate.replace(
-        /\{id\}|\{resolution\}|\{category\}|\{ext\}|\{size\}/g,
-        (match) => tokens[match] ?? match
-      );
+      const tokenPattern = new RegExp(Object.keys(tokens).map((t) => t.replace(/[{}]/g, '\\$&')).join('|'), 'g');
 
-      if (CONFIG.removeWallhavenPrefix) {
+      let base = Settings.get('filenameTemplate').replace(tokenPattern, (match) => `${tokens[match]}` ?? match);
+
+      if (Settings.get('removeWallhavenPrefix')) {
         base = base.replace(/^wallhaven-/i, '');
       }
 
-      const filename = `${base}.${data.ext ?? 'jpg'}`;
-      return Utils.sanitizeFilename(filename);
+      return Utils.sanitizeFilename(`${base}.${ext}`);
     },
 
     /**
@@ -339,10 +547,8 @@
      */
     async copyToClipboard(text) {
       try {
-        if (typeof GM_setClipboard === 'function') {
-          GM_setClipboard(text, 'text');
-          return true;
-        }
+        const result = GMC.setClipboard(text, 'text');
+        if (result !== null) return true;
       } catch (err) {
         Logger.warn('GM_setClipboard failed, falling back to Clipboard API', err);
       }
@@ -358,12 +564,77 @@
   };
 
   /* ==========================================================================
+   * API CLIENT
+   * Talks to the official Wallhaven API (https://wallhaven.cc/api/v1/w/{id})
+   * to fetch rich, reliable metadata in a single request. HTML scraping is
+   * only used as a fallback if this fails (auth-gated NSFW walls without an
+   * API key, network issues, API downtime, etc.).
+   * ======================================================================== */
+  const ApiClient = {
+    BASE_URL: 'https://wallhaven.cc/api/v1/w/',
+
+    /**
+     * @param {string} id
+     * @returns {Promise<object>} the API's `data` object
+     */
+    fetchWallpaper(id) {
+      const apiKey = Settings.get('apiKey');
+      const url = this.BASE_URL + encodeURIComponent(id) + (apiKey ? `?apikey=${encodeURIComponent(apiKey)}` : '');
+
+      return new Promise((resolve, reject) => {
+        let request;
+        try {
+          request = GMC.xmlHttpRequest({
+            method: 'GET',
+            url,
+            timeout: 10000,
+            responseType: 'text',
+            headers: { Accept: 'application/json' },
+            onload: (resp) => {
+              if (resp.status === 401 || resp.status === 403) {
+                return reject(classifiedError('FORBIDDEN', 'Wallhaven API access denied (NSFW walls require an API key).'));
+              }
+              if (resp.status === 404) {
+                return reject(classifiedError('NOT_FOUND', 'Wallhaven API reported this wallpaper does not exist.'));
+              }
+              if (resp.status === 429) {
+                return reject(classifiedError('RATE_LIMITED', 'Wallhaven API rate limit reached.'));
+              }
+              if (resp.status !== 200) {
+                return reject(classifiedError('HTTP_ERROR', `Wallhaven API returned HTTP ${resp.status}.`));
+              }
+              try {
+                const json = JSON.parse(resp.responseText);
+                if (!json || !json.data) {
+                  return reject(new Error('Malformed Wallhaven API response.'));
+                }
+                resolve(json.data);
+              } catch (err) {
+                reject(err);
+              }
+            },
+            onerror: () => reject(classifiedError('NETWORK_ERROR', 'Network error contacting the Wallhaven API.')),
+            ontimeout: () => reject(classifiedError('TIMEOUT', 'Wallhaven API request timed out.')),
+          });
+        } catch (err) {
+          reject(err);
+        }
+        return request;
+      });
+    },
+  };
+
+  /* ==========================================================================
    * WALLPAPER DATA
-   * Resolves everything we know about the wallpaper currently on screen.
+   * Resolves everything we know about the wallpaper currently on screen,
+   * preferring the Wallhaven API and falling back to HTML parsing. Results
+   * are cached per wallpaper ID until navigation invalidates the cache.
    * ======================================================================== */
   const WallpaperData = {
     /** @type {HTMLImageElement|null} */
     _imageEl: null,
+    /** @type {object|null} */
+    _cache: null,
 
     /**
      * Locate the full-resolution <img> element for the current page.
@@ -394,9 +665,8 @@
         }
       }
 
-      // Element may not have rendered yet (lazy load / slow network).
       const found = await Utils.waitForElement(selectors.join(', '), {
-        timeout: CONFIG.elementWaitTimeout,
+        timeout: Config.STATIC.elementWaitTimeout,
       });
       if (found && found.tagName === 'IMG') {
         this._imageEl = found;
@@ -407,10 +677,20 @@
 
     /**
      * Gather all metadata needed to build a filename and perform a download.
-     * Returns `null` if no original image could be located on this page.
-     * @returns {Promise<null | {id:string, url:string, ext:string, resolution:string, category:string, size:string}>}
+     * Uses the Wallhaven API when possible, and caches the result per ID so
+     * repeated actions (download, copy URL, copy filename, copy tags, open
+     * original) don't repeat the same lookup.
+     *
+     * @param {{ forceRefresh?: boolean }} [options]
+     * @returns {Promise<null | object>}
      */
-    async resolve() {
+    async resolve(options = {}) {
+      const currentPageId = Utils.extractId(location.href);
+
+      if (!options.forceRefresh && this._cache && this._cache.id === currentPageId) {
+        return this._cache;
+      }
+
       const img = await this.findImageElement();
       if (!img || !img.src) {
         Logger.warn('Could not locate the original wallpaper image on this page.');
@@ -418,7 +698,7 @@
       }
 
       const url = img.src;
-      const id = Utils.extractId(url) || Utils.extractId(location.href);
+      const id = Utils.extractId(url) || currentPageId;
       const ext = Utils.extractExtension(url) || 'jpg';
 
       if (!id) {
@@ -426,16 +706,85 @@
         return null;
       }
 
-      const resolution = Utils.findStatByLabel('Resolution') || `${img.naturalWidth || 0}x${img.naturalHeight || 0}`;
-      const size = Utils.findStatByLabel('Size') || 'unknown';
-      const category = Utils.detectCategory() || 'wallpaper';
+      let apiData = null;
+      try {
+        apiData = await ApiClient.fetchWallpaper(id);
+      } catch (err) {
+        Logger.warn('Wallhaven API lookup failed, falling back to HTML parsing.', err);
+      }
 
-      return { id, url, ext, resolution, category, size };
+      const data = apiData ? this._fromApi(apiData, { url, ext }) : this._fromHtml({ url, ext, id, img });
+      this._cache = data;
+      return data;
+    },
+
+    /**
+     * @param {object} api - the Wallhaven API's `data` payload
+     * @param {{url:string, ext:string}} fallback
+     */
+    _fromApi(api, fallback) {
+      const width = api.dimension_x ?? null;
+      const height = api.dimension_y ?? null;
+      const imageUrl = api.path || fallback.url;
+
+      return {
+        id: api.id ?? Utils.extractId(imageUrl),
+        url: imageUrl,
+        ext: Utils.extractExtension(imageUrl) || fallback.ext,
+        resolution: api.resolution || (width && height ? `${width}x${height}` : 'unknown'),
+        width: width ?? 'unknown',
+        height: height ?? 'unknown',
+        ratio: api.ratio ? String(api.ratio) : width && height ? (width / height).toFixed(2) : 'unknown',
+        category: api.category || 'wallpaper',
+        purity: api.purity || 'unknown',
+        uploader: api.uploader && api.uploader.username ? api.uploader.username : 'unknown',
+        views: api.views ?? 'unknown',
+        favorites: api.favorites ?? 'unknown',
+        size: api.file_size ? Utils.formatBytes(api.file_size) : 'unknown',
+        filesize: typeof api.file_size === 'number' ? api.file_size : null,
+        colors: Array.isArray(api.colors) ? api.colors.join(',') : 'unknown',
+        date: api.created_at ? String(api.created_at).split(' ')[0] : 'unknown',
+        tags: Array.isArray(api.tags) ? api.tags.map((t) => t.name) : null,
+        source: 'api',
+      };
+    },
+
+    /**
+     * @param {{url:string, ext:string, id:string, img:HTMLImageElement}} params
+     */
+    _fromHtml({ url, ext, id, img }) {
+      const resolution = Utils.findStatByLabel('Resolution') || `${img.naturalWidth || 0}x${img.naturalHeight || 0}`;
+      const [width, height] = Utils.normalizeResolution(resolution)
+        .split('x')
+        .map((n) => parseInt(n, 10) || 0);
+      const sizeLabel = Utils.findStatByLabel('Size');
+
+      return {
+        id,
+        url,
+        ext,
+        resolution,
+        width: width || 'unknown',
+        height: height || 'unknown',
+        ratio: width && height ? (width / height).toFixed(2) : 'unknown',
+        category: Utils.detectCategory() || 'wallpaper',
+        purity: Utils.detectPurity() || 'unknown',
+        uploader: Utils.detectUploader() || 'unknown',
+        views: Utils.findStatByLabel('Views') || 'unknown',
+        favorites: Utils.findStatByLabel('Favorites') || 'unknown',
+        size: sizeLabel || 'unknown',
+        filesize: null,
+        colors: 'unknown',
+        date: Utils.findStatByLabel('Uploaded') || 'unknown',
+        tags: null,
+        source: 'html',
+      };
     },
 
     /** Clear cached references, e.g. after SPA-style navigation. */
     reset() {
       this._imageEl = null;
+      this._cache = null;
     },
   };
 
@@ -463,9 +812,10 @@
      * @param {string} message
      * @param {'info'|'success'|'error'|'warning'} type
      * @param {{ actionLabel?: string, onAction?: Function, duration?: number }} [options]
+     * @returns {{dismiss: Function, setText: Function}|undefined}
      */
     show(message, type = 'info', options = {}) {
-      if (!CONFIG.showNotifications) return;
+      if (!Settings.get('showNotifications')) return undefined;
 
       const container = this._ensureContainer();
       const toast = document.createElement('div');
@@ -513,10 +863,15 @@
         toast.addEventListener('transitionend', () => toast.remove(), { once: true });
       };
 
-      const duration = options.duration ?? CONFIG.toastDurationMs;
+      const duration = options.duration ?? Config.STATIC.toastDurationMs;
       if (duration > 0) setTimeout(dismiss, duration);
 
-      return { dismiss };
+      return {
+        dismiss,
+        setText: (newMessage) => {
+          text.textContent = newMessage;
+        },
+      };
     },
 
     success(message, options) {
@@ -559,13 +914,21 @@
     spinner:
       '<svg class="wod-spin" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ' +
       'stroke-width="2" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9"/></svg>',
+    gear:
+      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" ' +
+      'stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/>' +
+      '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 ' +
+      '1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83' +
+      'l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82' +
+      'l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51' +
+      ' 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4' +
+      'h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
   };
 
   /* ==========================================================================
    * STYLES
    * Injected once. Uses CSS variables so it can be re-themed easily and
-   * matches Wallhaven's existing dark palette (#2E2E33 panels / #0088cc
-   * accent-ish tones adapted to a neutral accent to stay visually native).
+   * matches Wallhaven's existing dark palette.
    * ======================================================================== */
   function injectStyles() {
     const css = `
@@ -624,6 +987,23 @@
         display: inline-flex;
         line-height: 0;
       }
+      .wod-btn__ring {
+        position: absolute;
+        inset: -3px;
+        border-radius: 9px;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.15s ease;
+        padding: 2px;
+        background: conic-gradient(var(--wod-accent) calc(var(--wod-progress, 0) * 360deg), transparent 0);
+        -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        -webkit-mask-composite: xor;
+        mask-composite: exclude;
+      }
+      .wod-btn--loading .wod-btn__ring {
+        opacity: 1;
+      }
 
       .wod-spin {
         animation: wod-spin-rotate 0.8s linear infinite;
@@ -649,13 +1029,15 @@
         75% { transform: translateX(3px); }
       }
 
-      .wod-floating {
+      .wod-floating-group {
         position: fixed;
         right: 20px;
         bottom: 20px;
         z-index: 9999;
-        height: 44px;
-        min-width: 44px;
+        display: flex;
+        gap: 8px;
+      }
+      .wod-floating-group .wod-btn {
         border-radius: 999px;
         box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
       }
@@ -744,58 +1126,167 @@
         background: var(--wod-bg-hover);
         color: var(--wod-accent);
       }
+
+      .wod-modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        z-index: 10002;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+      }
+      .wod-modal {
+        width: 100%;
+        max-width: 440px;
+        max-height: 86vh;
+        overflow-y: auto;
+        background: var(--wod-bg);
+        border: 1px solid var(--wod-border);
+        border-radius: 10px;
+        color: var(--wod-text);
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+      }
+      .wod-modal__header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--wod-border);
+      }
+      .wod-modal__header h2 {
+        font-size: 15px;
+        margin: 0;
+      }
+      .wod-modal__close {
+        background: transparent;
+        border: none;
+        color: var(--wod-muted);
+        font-size: 20px;
+        cursor: pointer;
+        line-height: 1;
+      }
+      .wod-modal__close:hover { color: var(--wod-text); }
+      .wod-modal__body {
+        padding: 14px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .wod-field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 13px;
+      }
+      .wod-field--checkbox {
+        flex-direction: row;
+        align-items: center;
+        gap: 8px;
+      }
+      .wod-field input[type="text"],
+      .wod-field input[type="number"],
+      .wod-field input[type="password"] {
+        background: #1b1b20;
+        border: 1px solid var(--wod-border);
+        border-radius: 4px;
+        color: var(--wod-text);
+        padding: 6px 8px;
+        font-size: 13px;
+      }
+      .wod-field input:focus {
+        outline: none;
+        border-color: var(--wod-accent);
+      }
+      .wod-field__hint {
+        font-size: 11px;
+        color: var(--wod-muted);
+        margin: -6px 0 0;
+        line-height: 1.5;
+      }
+      .wod-modal__footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        padding: 14px 16px;
+        border-top: 1px solid var(--wod-border);
+      }
+      .wod-btn--primary {
+        background: var(--wod-accent);
+        color: #0b1a1f;
+        border-color: var(--wod-accent);
+        font-weight: 600;
+      }
+      .wod-btn--primary:hover {
+        filter: brightness(1.08);
+      }
     `;
 
-    if (typeof GM_addStyle === 'function') {
-      GM_addStyle(css);
-    } else {
-      const style = document.createElement('style');
-      style.textContent = css;
-      document.head.appendChild(style);
-    }
+    GMC.addStyle(css);
   }
 
   /* ==========================================================================
    * DOWNLOADER
-   * Wraps GM_download (with a manual-save fallback) in a Promise, complete
-   * with retry/back-off and progress reporting.
+   * Fetches the original image via GM_xmlhttpRequest as a validated Blob
+   * (HTTP status, content-type, content-length, and non-empty checks) before
+   * ever touching disk, then saves the Blob via GM_download - falling back
+   * to a universal anchor-click Blob download when GM_download is
+   * unavailable. Retries transient failures with linear back-off and skips
+   * retrying permanent failures (404, 403, invalid content, etc).
    * ======================================================================== */
-  const Downloader = {
-    /** IDs already downloaded this browser session (in-memory only). */
-    _downloadedIds: new Set(),
-    /** IDs currently mid-download, to prevent double-clicks. */
-    _inFlight: new Set(),
+  const PERMANENT_ERROR_CODES = new Set([
+    'NOT_FOUND',
+    'FORBIDDEN',
+    'CHALLENGE_PAGE',
+    'INVALID_CONTENT_TYPE',
+    'EMPTY_RESPONSE',
+  ]);
 
-    isGmDownloadAvailable() {
-      return typeof GM_download === 'function';
+  const Downloader = {
+    /** In-memory mirror of persisted download history (session + past runs). */
+    _history: [],
+    _downloadedIds: new Set(),
+
+    /** Load persisted download history from GM storage. Call once at startup. */
+    async loadHistory() {
+      const stored = await GMC.getValue(Config.HISTORY_KEY, []);
+      this._history = Array.isArray(stored) ? stored : [];
+      this._downloadedIds = new Set(this._history.map((entry) => entry.id));
+    },
+
+    async _persistHistory() {
+      const trimmed = this._history.slice(-Config.MAX_HISTORY_ENTRIES);
+      this._history = trimmed;
+      await GMC.setValue(Config.HISTORY_KEY, trimmed);
+    },
+
+    async _recordDownload(id, filename) {
+      this._history.push({ id, filename, timestamp: Date.now() });
+      this._downloadedIds.add(id);
+      await this._persistHistory();
+    },
+
+    async clearHistory() {
+      this._history = [];
+      this._downloadedIds.clear();
+      await GMC.setValue(Config.HISTORY_KEY, []);
     },
 
     /**
-     * @param {{id:string,url:string,ext:string,resolution:string,category:string,size:string}} data
-     * @param {{saveAs?: boolean, onProgress?: Function, force?: boolean}} [options]
+     * @param {{id:string,url:string,ext:string}} data
+     * @param {{saveAs?: boolean, force?: boolean, onProgress?: Function}} [options]
      * @returns {Promise<{filename:string}>}
      */
     async download(data, options = {}) {
-      if (this._inFlight.has(data.id)) {
-        throw new Error('A download for this wallpaper is already in progress.');
+      if (Settings.get('preventDuplicates') && this._downloadedIds.has(data.id) && !options.force) {
+        throw classifiedError('DUPLICATE', 'Already downloaded this wallpaper this session.');
       }
 
-      if (CONFIG.preventDuplicates && this._downloadedIds.has(data.id) && !options.force) {
-        const err = new Error('DUPLICATE');
-        err.code = 'DUPLICATE';
-        throw err;
-      }
-
-      this._inFlight.add(data.id);
       const filename = Utils.renderFilename(data);
-
-      try {
-        await this._downloadWithRetry(data.url, filename, options);
-        this._downloadedIds.add(data.id);
-        return { filename };
-      } finally {
-        this._inFlight.delete(data.id);
-      }
+      await this._downloadWithRetry(data.url, filename, options);
+      await this._recordDownload(data.id, filename);
+      return { filename };
     },
 
     /**
@@ -804,19 +1295,20 @@
      * @param {{saveAs?: boolean, onProgress?: Function}} options
      */
     async _downloadWithRetry(url, filename, options) {
-      const maxAttempts = Math.max(1, CONFIG.retryCount);
+      const maxAttempts = Math.max(1, Settings.get('retryCount'));
       let lastError = null;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
+          // eslint-disable-next-line no-await-in-loop
           await this._downloadOnce(url, filename, options);
           return;
         } catch (err) {
           lastError = err;
-          Logger.warn(`Download attempt ${attempt}/${maxAttempts} failed:`, err);
-          if (attempt < maxAttempts) {
-            await Utils.sleep(CONFIG.retryDelay * attempt);
-          }
+          Logger.warn(`Download attempt ${attempt}/${maxAttempts} failed [${err.code || 'UNKNOWN'}]`, err);
+          if (PERMANENT_ERROR_CODES.has(err.code) || attempt >= maxAttempts) break;
+          // eslint-disable-next-line no-await-in-loop
+          await Utils.sleep(Config.STATIC.retryDelay * attempt);
         }
       }
 
@@ -828,19 +1320,112 @@
      * @param {string} filename
      * @param {{saveAs?: boolean, onProgress?: Function}} options
      */
-    _downloadOnce(url, filename, options) {
-      const saveAs = options.saveAs ?? CONFIG.saveAs;
+    async _downloadOnce(url, filename, options) {
+      const saveAs = options.saveAs ?? Settings.get('saveAs');
+      const blob = await this._fetchValidatedBlob(url, options);
+      await this._saveBlob(blob, filename, saveAs);
+    },
 
-      if (!this.isGmDownloadAvailable()) {
-        // Graceful fallback for userscript managers without GM_download
-        // support (e.g. some Greasemonkey configurations): open the
-        // original image in a new tab so the user can save it manually.
-        Logger.warn('GM_download is unavailable; opening original image for manual save.');
-        if (typeof GM_openInTab === 'function') {
-          GM_openInTab(url, { active: true, insert: true, setParent: true });
-        } else {
-          window.open(url, '_blank', 'noopener');
+    /**
+     * GM_xmlhttpRequest-based fetch of the original image with full
+     * validation before the bytes are ever handed off to be saved:
+     *  - HTTP 200 required (403/404/429 classified explicitly)
+     *  - Content-Type must be image/* (rejects HTML error/challenge pages)
+     *  - Non-zero byte count required
+     *  - Content-Length (if present) cross-checked against the actual Blob
+     *
+     * @param {string} url
+     * @param {{onProgress?: Function}} options
+     * @returns {Promise<Blob>}
+     */
+    _fetchValidatedBlob(url, options) {
+      return new Promise((resolve, reject) => {
+        try {
+          GMC.xmlHttpRequest({
+            method: 'GET',
+            url,
+            responseType: 'blob',
+            timeout: 30000,
+            headers: { Accept: 'image/*' },
+            onprogress: (evt) => {
+              if (typeof options.onProgress === 'function' && evt && evt.lengthComputable) {
+                options.onProgress(evt.loaded / evt.total);
+              }
+            },
+            onload: (resp) => {
+              const status = resp.status;
+
+              if (status === 403) {
+                return reject(classifiedError('FORBIDDEN', ERROR_MESSAGES.FORBIDDEN));
+              }
+              if (status === 404) {
+                return reject(classifiedError('NOT_FOUND', ERROR_MESSAGES.NOT_FOUND));
+              }
+              if (status === 429) {
+                return reject(classifiedError('RATE_LIMITED', ERROR_MESSAGES.RATE_LIMITED));
+              }
+              if (status !== 200) {
+                return reject(classifiedError('HTTP_ERROR', `Unexpected server response (HTTP ${status}).`));
+              }
+
+              const headers = resp.responseHeaders || '';
+              const contentTypeMatch = headers.match(/^content-type:\s*([^\r\n]+)/im);
+              const contentType = contentTypeMatch ? contentTypeMatch[1].split(';')[0].trim().toLowerCase() : '';
+              const contentLengthMatch = headers.match(/^content-length:\s*(\d+)/im);
+              const declaredLength = contentLengthMatch ? parseInt(contentLengthMatch[1], 10) : null;
+
+              const blob = resp.response;
+
+              if (declaredLength === 0 || !blob || blob.size === 0) {
+                return reject(classifiedError('EMPTY_RESPONSE', ERROR_MESSAGES.EMPTY_RESPONSE));
+              }
+              if (contentType.startsWith('text/html')) {
+                return reject(classifiedError('CHALLENGE_PAGE', ERROR_MESSAGES.CHALLENGE_PAGE));
+              }
+              if (contentType && !contentType.startsWith('image/')) {
+                return reject(
+                  classifiedError('INVALID_CONTENT_TYPE', `Unexpected content type "${contentType}"; refusing to save.`)
+                );
+              }
+              if (declaredLength && blob.size !== declaredLength) {
+                Logger.warn(`Content-Length mismatch for ${url}: expected ${declaredLength}, got ${blob.size}.`);
+              }
+
+              resolve(blob);
+            },
+            onerror: () => reject(classifiedError('NETWORK_ERROR', ERROR_MESSAGES.NETWORK_ERROR)),
+            ontimeout: () => reject(classifiedError('TIMEOUT', ERROR_MESSAGES.TIMEOUT)),
+          });
+        } catch (err) {
+          reject(err);
         }
+      });
+    },
+
+    /**
+     * Save an already-validated Blob to disk. Prefers GM_download (which can
+     * honour the "Save As" dialog setting); falls back to a plain
+     * anchor-click Blob download when GM_download isn't available at all
+     * (e.g. some Greasemonkey configurations), which requires no special
+     * permission and works purely in page context.
+     *
+     * @param {Blob} blob
+     * @param {string} filename
+     * @param {boolean} saveAs
+     */
+    _saveBlob(blob, filename, saveAs) {
+      const objectUrl = URL.createObjectURL(blob);
+      const revoke = () => setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
+
+      if (!GMC.hasDownload()) {
+        Logger.warn('GM_download is unavailable; using anchor-based Blob download fallback.');
+        const anchor = document.createElement('a');
+        anchor.href = objectUrl;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        revoke();
         return Promise.resolve();
       }
 
@@ -849,42 +1434,43 @@
         const timeoutHandle = setTimeout(() => {
           if (settled) return;
           settled = true;
-          reject(new Error('Download timed out.'));
+          revoke();
+          reject(classifiedError('TIMEOUT', 'Saving the file timed out.'));
         }, 30000);
 
         try {
-          GM_download({
-            url,
+          GMC.download({
+            url: objectUrl,
             name: filename,
             saveAs,
             onload: () => {
               if (settled) return;
               settled = true;
               clearTimeout(timeoutHandle);
+              revoke();
               resolve();
             },
             onerror: (err) => {
               if (settled) return;
               settled = true;
               clearTimeout(timeoutHandle);
-              const reason = err && err.error ? err.error : 'unknown_error';
-              reject(new Error(`GM_download failed: ${reason}`));
+              revoke();
+              const reason = err && err.error ? String(err.error) : 'unknown_error';
+              const code = reason === 'permission_denied' ? 'PERMISSION_DENIED' : 'GM_DOWNLOAD_FAILED';
+              reject(classifiedError(code, `GM_download failed: ${reason}`));
             },
             ontimeout: () => {
               if (settled) return;
               settled = true;
               clearTimeout(timeoutHandle);
-              reject(new Error('GM_download timed out.'));
-            },
-            onprogress: (progress) => {
-              if (typeof options.onProgress === 'function' && progress && progress.lengthComputable) {
-                options.onProgress(progress.loaded / progress.total);
-              }
+              revoke();
+              reject(classifiedError('TIMEOUT', 'GM_download timed out.'));
             },
           });
         } catch (err) {
           clearTimeout(timeoutHandle);
           settled = true;
+          revoke();
           reject(err);
         }
       });
@@ -892,13 +1478,68 @@
   };
 
   /* ==========================================================================
+   * DOWNLOAD QUEUE
+   * Serializes downloads so only one runs at a time (rather than racing
+   * multiple concurrent GM_xmlhttpRequest/GM_download calls), and rejects
+   * attempts to queue the same wallpaper twice while it's already pending.
+   * ======================================================================== */
+  const DownloadQueue = {
+    _items: [],
+    _active: false,
+    _queuedIds: new Set(),
+
+    get size() {
+      return this._items.length;
+    },
+
+    /**
+     * @param {object} data
+     * @param {object} options
+     * @returns {Promise<{filename:string}>}
+     */
+    enqueue(data, options) {
+      if (this._queuedIds.has(data.id)) {
+        return Promise.reject(classifiedError('ALREADY_QUEUED', ERROR_MESSAGES.ALREADY_QUEUED));
+      }
+
+      this._queuedIds.add(data.id);
+      return new Promise((resolve, reject) => {
+        this._items.push({ data, options, resolve, reject });
+        void this._pump();
+      });
+    },
+
+    async _pump() {
+      if (this._active) return;
+      this._active = true;
+
+      while (this._items.length > 0) {
+        const { data, options, resolve, reject } = this._items.shift();
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const result = await Downloader.download(data, options);
+          resolve(result);
+        } catch (err) {
+          reject(err);
+        } finally {
+          this._queuedIds.delete(data.id);
+        }
+      }
+
+      this._active = false;
+    },
+  };
+
+  /* ==========================================================================
    * UI
-   * Injects the download control into Wallhaven's existing action bar,
-   * falling back to a floating button if the action bar cannot be located.
+   * Injects the download control (and a settings gear) into Wallhaven's
+   * existing action bar, falling back to a floating button group if the
+   * action bar cannot be located.
    * ======================================================================== */
   const UI = {
-    _button: null,
-    _progressRing: null,
+    _downloadButton: null,
+    _settingsButton: null,
+    _hostBar: null,
 
     /**
      * Candidate selectors for Wallhaven's native action bar, ordered from
@@ -922,40 +1563,53 @@
         if (hostBar) break;
       }
       if (!hostBar) {
-        hostBar = await Utils.waitForElement(this.ACTION_BAR_SELECTORS.join(', '), {
-          timeout: 3000,
-        });
+        hostBar = await Utils.waitForElement(this.ACTION_BAR_SELECTORS.join(', '), { timeout: 3000 });
       }
+      this._hostBar = hostBar;
 
-      const button = this._buildButton();
-      this._button = button;
+      const downloadButton = this._buildDownloadButton();
+      const settingsButton = this._buildSettingsButton();
+      this._downloadButton = downloadButton;
+      this._settingsButton = settingsButton;
 
       if (hostBar) {
-        hostBar.appendChild(button);
-        Logger.debug('Mounted download button into native action bar.');
-      } else if (CONFIG.enableFloatingFallback) {
-        button.classList.add('wod-floating');
-        document.body.appendChild(button);
-        Logger.debug('Native action bar not found; using floating fallback button.');
+        hostBar.append(downloadButton, settingsButton);
+        Logger.debug('Mounted controls into native action bar.');
+      } else if (Config.STATIC.enableFloatingFallback) {
+        const group = document.createElement('div');
+        group.className = 'wod-floating-group';
+        group.append(downloadButton, settingsButton);
+        document.body.appendChild(group);
+        this._floatingGroup = group;
+        Logger.debug('Native action bar not found; using floating fallback controls.');
       } else {
         Logger.warn('Native action bar not found and floating fallback is disabled; UI not mounted.');
-        this._button = null;
+        this._downloadButton = null;
+        this._settingsButton = null;
       }
     },
 
     unmount() {
-      if (this._button && this._button.isConnected) {
-        this._button.remove();
+      if (this._floatingGroup && this._floatingGroup.isConnected) {
+        this._floatingGroup.remove();
       }
-      this._button = null;
+      this._floatingGroup = null;
+      if (this._downloadButton && this._downloadButton.isConnected) this._downloadButton.remove();
+      if (this._settingsButton && this._settingsButton.isConnected) this._settingsButton.remove();
+      this._downloadButton = null;
+      this._settingsButton = null;
     },
 
-    _buildButton() {
+    _buildDownloadButton() {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'wod-btn';
       button.title = 'Download original wallpaper (D)';
       button.setAttribute('aria-label', 'Download original wallpaper');
+
+      const ring = document.createElement('span');
+      ring.className = 'wod-btn__ring';
+      button.appendChild(ring);
 
       const iconSpan = document.createElement('span');
       iconSpan.className = 'wod-btn__icon';
@@ -968,22 +1622,38 @@
       button.appendChild(label);
 
       button.addEventListener('click', () => {
-        void App.handleDownloadRequest({ saveAs: CONFIG.saveAs });
+        void App.handleDownloadRequest({ saveAs: Settings.get('saveAs') });
       });
 
       return button;
     },
 
+    _buildSettingsButton() {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'wod-btn';
+      button.title = 'Downloader settings';
+      button.setAttribute('aria-label', 'Open downloader settings');
+
+      const iconSpan = document.createElement('span');
+      iconSpan.className = 'wod-btn__icon';
+      iconSpan.innerHTML = Icons.gear;
+      button.appendChild(iconSpan);
+
+      button.addEventListener('click', () => SettingsUI.open());
+      return button;
+    },
+
     setState(state) {
-      const button = this._button;
+      const button = this._downloadButton;
       if (!button) return;
 
-      button.classList.remove('wod-btn--disabled', 'wod-btn--success', 'wod-btn--error');
+      button.classList.remove('wod-btn--disabled', 'wod-btn--success', 'wod-btn--error', 'wod-btn--loading');
       const icon = button.querySelector('.wod-btn__icon');
 
       switch (state) {
         case 'loading':
-          button.classList.add('wod-btn--disabled');
+          button.classList.add('wod-btn--disabled', 'wod-btn--loading');
           button.disabled = true;
           if (icon) icon.innerHTML = Icons.spinner;
           break;
@@ -1006,6 +1676,163 @@
           break;
       }
     },
+
+    /** @param {number} fraction 0..1 */
+    setProgress(fraction) {
+      const button = this._downloadButton;
+      if (!button) return;
+      const clamped = Math.max(0, Math.min(1, fraction));
+      button.style.setProperty('--wod-progress', String(clamped));
+    },
+  };
+
+  /* ==========================================================================
+   * SETTINGS UI
+   * A small in-page modal (no page reload) for editing every persisted
+   * setting, plus a "clear history" action.
+   * ======================================================================== */
+  const SettingsUI = {
+    _overlay: null,
+    _escHandler: null,
+
+    open() {
+      if (this._overlay) return;
+
+      const overlay = document.createElement('div');
+      overlay.className = 'wod-modal-overlay';
+
+      const modal = document.createElement('div');
+      modal.className = 'wod-modal';
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      modal.setAttribute('aria-label', 'Wallhaven downloader settings');
+
+      modal.innerHTML = `
+        <div class="wod-modal__header">
+          <h2>Downloader Settings</h2>
+          <button type="button" class="wod-modal__close" aria-label="Close">&times;</button>
+        </div>
+        <div class="wod-modal__body">
+          <label class="wod-field">
+            <span>Filename template</span>
+            <input type="text" name="filenameTemplate" />
+          </label>
+          <p class="wod-field__hint">
+            Tokens: {id} {resolution} {width} {height} {ratio} {category} {ext} {extension}
+            {size} {filesize} {views} {favorites} {purity} {uploader} {colors} {date}
+          </p>
+          <label class="wod-field wod-field--checkbox">
+            <input type="checkbox" name="saveAs" />
+            <span>Show "Save As" dialog on download</span>
+          </label>
+          <label class="wod-field wod-field--checkbox">
+            <input type="checkbox" name="removeWallhavenPrefix" />
+            <span>Remove "wallhaven-" prefix</span>
+          </label>
+          <label class="wod-field wod-field--checkbox">
+            <input type="checkbox" name="showNotifications" />
+            <span>Show toast notifications</span>
+          </label>
+          <label class="wod-field wod-field--checkbox">
+            <input type="checkbox" name="keyboardShortcuts" />
+            <span>Enable keyboard shortcuts (D / Ctrl+D / Shift+D / Alt+D)</span>
+          </label>
+          <label class="wod-field wod-field--checkbox">
+            <input type="checkbox" name="enableContextMenu" />
+            <span>Enable right-click context menu</span>
+          </label>
+          <label class="wod-field wod-field--checkbox">
+            <input type="checkbox" name="preventDuplicates" />
+            <span>Warn before re-downloading the same wallpaper</span>
+          </label>
+          <label class="wod-field">
+            <span>Retry attempts on failure</span>
+            <input type="number" name="retryCount" min="1" max="10" />
+          </label>
+          <label class="wod-field">
+            <span>Wallhaven API key (optional, needed for NSFW metadata)</span>
+            <input type="password" name="apiKey" autocomplete="off" />
+          </label>
+        </div>
+        <div class="wod-modal__footer">
+          <button type="button" class="wod-btn" data-action="clear-history">Clear history</button>
+          <button type="button" class="wod-btn" data-action="reset">Reset defaults</button>
+          <button type="button" class="wod-btn wod-btn--primary" data-action="save">Save</button>
+        </div>
+      `;
+
+      overlay.appendChild(modal);
+      document.body.appendChild(overlay);
+      this._overlay = overlay;
+
+      this._populate(modal);
+      this._bind(modal, overlay);
+    },
+
+    _populate(modal) {
+      modal.querySelector('[name="filenameTemplate"]').value = Settings.get('filenameTemplate');
+      modal.querySelector('[name="saveAs"]').checked = Settings.get('saveAs');
+      modal.querySelector('[name="removeWallhavenPrefix"]').checked = Settings.get('removeWallhavenPrefix');
+      modal.querySelector('[name="showNotifications"]').checked = Settings.get('showNotifications');
+      modal.querySelector('[name="keyboardShortcuts"]').checked = Settings.get('keyboardShortcuts');
+      modal.querySelector('[name="enableContextMenu"]').checked = Settings.get('enableContextMenu');
+      modal.querySelector('[name="preventDuplicates"]').checked = Settings.get('preventDuplicates');
+      modal.querySelector('[name="retryCount"]').value = Settings.get('retryCount');
+      modal.querySelector('[name="apiKey"]').value = Settings.get('apiKey');
+    },
+
+    _bind(modal, overlay) {
+      const close = () => this.close();
+
+      overlay.addEventListener('click', (event) => {
+        if (event.target === overlay) close();
+      });
+      modal.querySelector('.wod-modal__close').addEventListener('click', close);
+
+      this._escHandler = (event) => {
+        if (event.key === 'Escape') close();
+      };
+      document.addEventListener('keydown', this._escHandler);
+
+      modal.querySelector('[data-action="save"]').addEventListener('click', async () => {
+        await Settings.set('filenameTemplate', modal.querySelector('[name="filenameTemplate"]').value.trim() || '{id}');
+        await Settings.set('saveAs', modal.querySelector('[name="saveAs"]').checked);
+        await Settings.set('removeWallhavenPrefix', modal.querySelector('[name="removeWallhavenPrefix"]').checked);
+        await Settings.set('showNotifications', modal.querySelector('[name="showNotifications"]').checked);
+        await Settings.set('keyboardShortcuts', modal.querySelector('[name="keyboardShortcuts"]').checked);
+        await Settings.set('enableContextMenu', modal.querySelector('[name="enableContextMenu"]').checked);
+        await Settings.set('preventDuplicates', modal.querySelector('[name="preventDuplicates"]').checked);
+
+        const retryValue = parseInt(modal.querySelector('[name="retryCount"]').value, 10);
+        await Settings.set('retryCount', Number.isFinite(retryValue) && retryValue > 0 ? retryValue : 3);
+        await Settings.set('apiKey', modal.querySelector('[name="apiKey"]').value.trim());
+
+        Notifications.success('Settings saved.');
+        close();
+      });
+
+      modal.querySelector('[data-action="reset"]').addEventListener('click', async () => {
+        await Settings.resetAll();
+        this._populate(modal);
+        Notifications.info('Settings reset to defaults.');
+      });
+
+      modal.querySelector('[data-action="clear-history"]').addEventListener('click', async () => {
+        await Downloader.clearHistory();
+        Notifications.info('Download history cleared.');
+      });
+    },
+
+    close() {
+      if (this._overlay) {
+        this._overlay.remove();
+        this._overlay = null;
+      }
+      if (this._escHandler) {
+        document.removeEventListener('keydown', this._escHandler);
+        this._escHandler = null;
+      }
+    },
   };
 
   /* ==========================================================================
@@ -1016,16 +1843,17 @@
     _menuEl: null,
 
     attach(imageEl) {
-      if (!CONFIG.enableContextMenu || !imageEl) return;
+      if (!imageEl) return;
       imageEl.addEventListener('contextmenu', (event) => this._onContextMenu(event));
     },
 
     _onContextMenu(event) {
+      if (!Settings.get('enableContextMenu')) return;
       event.preventDefault();
       this._close();
 
       const items = [
-        { label: 'Download Original', action: () => App.handleDownloadRequest({ saveAs: CONFIG.saveAs }) },
+        { label: 'Download Original', action: () => App.handleDownloadRequest({ saveAs: Settings.get('saveAs') }) },
         { label: 'Open Original', action: () => App.openOriginal() },
         { label: 'Copy Image URL', action: () => App.copyImageUrl() },
         { label: 'Copy Filename', action: () => App.copyFilename() },
@@ -1085,14 +1913,16 @@
   /* ==========================================================================
    * KEYBOARD
    * Handles the D / Ctrl+D / Shift+D / Alt+D shortcuts, ignoring keystrokes
-   * while the user is typing in a form field.
+   * while the user is typing in a form field. The enabled/disabled state is
+   * re-checked on every keystroke against live settings, so toggling the
+   * "keyboard shortcuts" setting takes effect immediately without needing to
+   * re-attach the listener.
    * ======================================================================== */
   const Keyboard = {
     _handler: null,
 
     attach() {
-      if (!CONFIG.keyboardShortcuts) return;
-      this.detach();
+      if (this._handler) return;
       this._handler = (event) => this._onKeyDown(event);
       document.addEventListener('keydown', this._handler, true);
     },
@@ -1108,12 +1938,7 @@
       const target = event.target;
       if (!target) return false;
       const tag = target.tagName;
-      return (
-        tag === 'INPUT' ||
-        tag === 'TEXTAREA' ||
-        tag === 'SELECT' ||
-        target.isContentEditable === true
-      );
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable === true;
     },
 
     _matches(event, shortcut) {
@@ -1127,9 +1952,10 @@
     },
 
     _onKeyDown(event) {
+      if (!Settings.get('keyboardShortcuts')) return;
       if (this._isTypingContext(event)) return;
 
-      const { shortcuts } = CONFIG;
+      const { shortcuts } = Config.STATIC;
 
       if (this._matches(event, shortcuts.downloadNoDialog)) {
         event.preventDefault();
@@ -1142,7 +1968,7 @@
         void App.copyFilename();
       } else if (this._matches(event, shortcuts.download)) {
         event.preventDefault();
-        void App.handleDownloadRequest({ saveAs: CONFIG.saveAs });
+        void App.handleDownloadRequest({ saveAs: Settings.get('saveAs') });
       }
     },
   };
@@ -1165,7 +1991,7 @@
       window.addEventListener('popstate', this._onNavigate);
       window.addEventListener('wod:navigate', this._onNavigate);
 
-      const debouncedCheck = Utils.debounce(() => this._checkForContentChange(), CONFIG.domObserverDebounce);
+      const debouncedCheck = Utils.debounce(() => this._checkForContentChange(), Config.STATIC.domObserverDebounce);
       this._mutationObserver = new MutationObserver(debouncedCheck);
       this._mutationObserver.observe(document.body, { childList: true, subtree: true });
     },
@@ -1199,7 +2025,8 @@
     },
 
     _checkForContentChange() {
-      const currentId = Utils.extractId(location.href) || Utils.extractId(document.querySelector('img#wallpaper')?.src || '');
+      const currentId =
+        Utils.extractId(location.href) || Utils.extractId(document.querySelector('img#wallpaper')?.src || '');
       if (currentId !== this._lastId) {
         this._lastId = currentId;
         Logger.debug('Detected navigation to a new wallpaper, reinitializing.', currentId);
@@ -1216,6 +2043,8 @@
    * ======================================================================== */
   const App = {
     async init() {
+      await Settings.init();
+      await Downloader.loadHistory();
       injectStyles();
       Keyboard.attach();
       PageObserver.start();
@@ -1241,16 +2070,15 @@
     },
 
     _registerMenuCommands() {
-      if (typeof GM_registerMenuCommand !== 'function') return;
-      try {
-        GM_registerMenuCommand('Download original wallpaper', () => {
-          void this.handleDownloadRequest({ saveAs: CONFIG.saveAs });
-        });
-        GM_registerMenuCommand('Copy original image URL', () => void this.copyImageUrl());
-        GM_registerMenuCommand('Copy filename', () => void this.copyFilename());
-      } catch (err) {
-        Logger.warn('Failed to register menu commands', err);
-      }
+      GMC.registerMenuCommand('Download original wallpaper', () => {
+        void this.handleDownloadRequest({ saveAs: Settings.get('saveAs') });
+      });
+      GMC.registerMenuCommand('Copy original image URL', () => void this.copyImageUrl());
+      GMC.registerMenuCommand('Copy filename', () => void this.copyFilename());
+      GMC.registerMenuCommand('Downloader settings…', () => SettingsUI.open());
+      GMC.registerMenuCommand('Clear download history', () => {
+        void Downloader.clearHistory().then(() => Notifications.info('Download history cleared.'));
+      });
     },
 
     /**
@@ -1258,6 +2086,16 @@
      */
     async handleDownloadRequest(options = {}) {
       UI.setState('loading');
+      UI.setProgress(0);
+
+      const progressToast = Config.STATIC.showProgress
+        ? Notifications.show('Downloading… 0%', 'info', { duration: 0 })
+        : undefined;
+
+      const onProgress = (fraction) => {
+        UI.setProgress(fraction);
+        if (progressToast) progressToast.setText(`Downloading… ${Math.round(fraction * 100)}%`);
+      };
 
       let data;
       try {
@@ -1268,16 +2106,20 @@
       }
 
       if (!data) {
+        if (progressToast) progressToast.dismiss();
         UI.setState('error');
         Notifications.error('Could not find the original wallpaper image on this page.');
         return;
       }
 
       try {
-        const result = await Downloader.download(data, options);
+        const result = await DownloadQueue.enqueue(data, { ...options, onProgress });
+        if (progressToast) progressToast.dismiss();
         UI.setState('success');
         Notifications.success(`Saved as ${result.filename}`);
       } catch (err) {
+        if (progressToast) progressToast.dismiss();
+
         if (err && err.code === 'DUPLICATE') {
           UI.setState('idle');
           Notifications.warning('Already downloaded this wallpaper this session.', {
@@ -1287,9 +2129,16 @@
           return;
         }
 
+        if (err && err.code === 'ALREADY_QUEUED') {
+          UI.setState('idle');
+          Notifications.info(ERROR_MESSAGES.ALREADY_QUEUED);
+          return;
+        }
+
         Logger.error('Download failed', err);
         UI.setState('error');
-        Notifications.error('Download failed. Click retry to try again.', {
+        const message = (err && ERROR_MESSAGES[err.code]) || (err && err.message) || 'Download failed.';
+        Notifications.error(message, {
           actionLabel: 'Retry',
           onAction: () => void this.handleDownloadRequest(options),
           duration: 6000,
@@ -1303,11 +2152,7 @@
         Notifications.error('Could not find the original wallpaper image on this page.');
         return;
       }
-      if (typeof GM_openInTab === 'function') {
-        GM_openInTab(data.url, { active: true, insert: true, setParent: true });
-      } else {
-        window.open(data.url, '_blank', 'noopener');
-      }
+      GMC.openInTab(data.url, { active: true, insert: true, setParent: true });
     },
 
     async copyImageUrl() {
@@ -1334,14 +2179,21 @@
     },
 
     async copyTags() {
-      const tagEls = document.querySelectorAll('#tags a, .tag-list a, a.tag');
-      const tags = Array.from(tagEls)
-        .map((el) => el.textContent.trim())
-        .filter(Boolean);
-      if (tags.length === 0) {
+      const data = await WallpaperData.resolve();
+      let tags = data && Array.isArray(data.tags) ? data.tags : null;
+
+      if (!tags) {
+        const tagEls = document.querySelectorAll('#tags a, .tag-list a, a.tag');
+        tags = Array.from(tagEls)
+          .map((el) => el.textContent.trim())
+          .filter(Boolean);
+      }
+
+      if (!tags || tags.length === 0) {
         Notifications.error('No tags found on this page.');
         return;
       }
+
       const ok = await Utils.copyToClipboard(tags.join(', '));
       if (ok) Notifications.success('Tags copied to clipboard.');
       else Notifications.error('Could not copy tags.');
