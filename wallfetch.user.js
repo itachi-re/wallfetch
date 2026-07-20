@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         WallFetch
 // @namespace    https://github.com/itachi-re/wallfetch
-// @version      1.5.0
+// @version      1.5.1
 // @description  Download original-resolution wallpapers from Wallhaven with metadata, persistent settings, download queue, and advanced customization.
 // @author       itachi-re
 // @license      MIT
 
-// @homepageURL  https://github.com/itachi-re/wallfetch
-// @supportURL   https://github.com/itachi-re/wallfetch/issues
-// @downloadURL  https://github.com/itachi-re/wallfetch/raw/main/dist/WallFetch.user.js
-// @updateURL    https://github.com/itachi-re/wallfetch/raw/main/dist/WallFetch.user.js
+// @homepageURL https://github.com/itachi-re/wallfetch
+// @supportURL  https://github.com/itachi-re/wallfetch/issues
+// @updateURL   https://update.greasyfork.org/scripts/587780/WallFetch.meta.js
+// @downloadURL https://update.greasyfork.org/scripts/587780/WallFetch.user.js
 
 // @match        https://wallhaven.cc/*
 // @match        https://*.wallhaven.cc/*
