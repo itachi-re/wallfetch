@@ -1,5 +1,12 @@
 # WallFetch
 
+[![Greasy Fork](https://img.shields.io/greasyfork/v/587780)](https://greasyfork.org/en/scripts/587780-wallfetch)
+[![Greasy Fork Downloads](https://img.shields.io/greasyfork/dt/587780)](https://greasyfork.org/en/scripts/587780-wallfetch)
+[![License](https://img.shields.io/github/license/itachi-re/wallfetch)](LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/itachi-re/wallfetch)](https://github.com/itachi-re/wallfetch)
+[![GitHub Issues](https://img.shields.io/github/issues/itachi-re/wallfetch)](https://github.com/itachi-re/wallfetch/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/itachi-re/wallfetch)](https://github.com/itachi-re/wallfetch/commits/main)
+
 A userscript that adds one-click original-resolution downloads to Wallhaven.
 
 Wallhaven's own download button gives you the resized preview. WallFetch grabs the original file instead, names it something sane, and gets out of your way.
@@ -23,17 +30,26 @@ Planned, not yet built — see [Roadmap](#roadmap).
 
 You'll need a userscript manager:
 
-- [Tampermonkey](https://www.tampermonkey.net/)
+- [ScriptCat](https://scriptcat.org/) (primary)
 - [Violentmonkey](https://violentmonkey.github.io/)
+- [Tampermonkey](https://www.tampermonkey.net/)
 - Greasemonkey / FireMonkey also work
 
-Then install the script:
+Then install the script from either source:
+
+**Greasy Fork (recommended)** — handles update checks automatically:
+
+```
+https://greasyfork.org/en/scripts/587780-wallfetch
+```
+
+**Raw GitHub** — always the latest commit, no update checks:
 
 ```
 https://raw.githubusercontent.com/itachi-re/wallfetch/main/wallfetch.user.js
 ```
 
-Your userscript manager should pick this up automatically and prompt you to install.
+Your userscript manager should pick either link up automatically and prompt you to install.
 
 Works on any Chromium-based browser and Firefox, plus derivatives (Brave, Vivaldi, LibreWolf, Zen, etc.) — anywhere your userscript manager runs.
 
@@ -73,6 +89,24 @@ Examples:
 
 ---
 
+## Compatibility
+
+Tested with:
+
+- **ScriptCat** (primary)
+- **Violentmonkey**
+- **Tampermonkey**
+
+Works reliably across all three — standard GM API usage throughout, no manager-specific hacks.
+
+---
+
+## Privacy
+
+WallFetch doesn't collect, transmit, or sell any personal data. All settings and configuration are stored locally within your userscript manager — nothing leaves your browser.
+
+---
+
 ## Roadmap
 
 - [ ] Download queue with progress tracking
@@ -89,7 +123,7 @@ Examples:
 
 Fork it, branch off, make your change, open a PR. Keep it simple.
 
-If you're filing a bug, include your browser, userscript manager, script version, and steps to reproduce.
+If you're filing a bug, include your browser, userscript manager, script version, and steps to reproduce. [Open an issue](https://github.com/itachi-re/wallfetch/issues) on GitHub.
 
 ---
 
@@ -99,4 +133,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Disclaimer
 
-WallFetch isn't affiliated with or endorsed by Wallhaven. Respect their Terms of Service and the license terms on individual wallpapers.
+WallFetch isn't affiliated with or endorsed by Wallhaven. Respect their Terms of Service and the licensing terms of individual wallpapers.
